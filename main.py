@@ -18,14 +18,15 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 # Data settings.
 DATA_PATH = "data/MERGED_CSV"
-SAMPLES_PER_CLASS_PER_FILE = 1000
-GLOBAL_CAP_PER_CLASS = 20000
+SAMPLES_PER_CLASS_PER_FILE = 5000
+GLOBAL_CAP_PER_CLASS = 1000000000 # Same as uncapped but just saves me
+# re-writing the code below.
 NUM_WORKERS = 16
 
 # Training settings.
 BATCH_SIZE = 1024
-MAX_EPOCHS = 100
-LEARNING_RATE = 1e-3
+MAX_EPOCHS = 50
+LEARNING_RATE = 1e-3 # 0.001
 EARLY_STOP_PATIENCE = 15
 LR_PATIENCE = 5
 RANDOM_STATE = 123
@@ -34,14 +35,10 @@ RANDOM_STATE = 123
 OUTPUT_DIR = "outputs"
 TRAINING_CURVES_PATH = f"{OUTPUT_DIR}/training_curves.pdf"
 CONFUSION_MATRIX_PATH = f"{OUTPUT_DIR}/confusion_matrix.pdf"
+CONFUSION_MATRIX_PERCENTAGE_PATH = f"{OUTPUT_DIR}/confusion_matrix_percentage.pdf"
 CLASSIFICATION_REPORT_PATH = f"{OUTPUT_DIR}/classification_report.txt"
 
 pandarallel.initialize(nb_workers=NUM_WORKERS, progress_bar=False, verbose=0)
-
-# TODO: Refactor codebase into smaller subfunctions as right now it looks
-#  horrid. preprocess_data needs shortening as many functions within it
-#  should be placed elsewhere in the code. Technically the code is fully
-#  functional however it needs TLC.
 
 
 def preprocess_data(data_path, max_per_class):
@@ -61,7 +58,7 @@ def preprocess_data(data_path, max_per_class):
 
     Returns:
         A tuple of (X_train, X_val, X_test, y_train, y_val, y_test,
-         class_names).
+         class_names, scaler, label_encoder).
     """
 
     # Find all CSV files within the directory stored in data_path that contain
@@ -250,17 +247,21 @@ def preprocess_data(data_path, max_per_class):
     print(f"\nSplit: {len(X_train):,} train, {len(X_val):,} val, "
           f"{len(X_test):,} test")
 
-    return X_train, X_val, X_test, y_train, y_val, y_test, class_names
+    return (X_train, X_val, X_test, y_train, y_val, y_test, class_names,
+            scaler, label_encoder)
 
 
 def build_model(input_shape, num_classes):
     """
     Here we construct the 1D-CNN model used for multi-class classification.
-    Batch normalisation is applied after each layer to stabilise training, and
-    dropout is used in the dense layers to reduce overfitting. No pooling is
-     applied as the input sequence is already short and pooling would discard
-     useful spatial information. The final softmax layer outputs
-     probability scores across all classes.
+    Two convolutional blocks are stacked with the filter count doubling
+    between them, so the first block can learn low level patterns and
+    the second can combine those into more complex ones. Batch
+    normalisation is applied after each layer to stabilise training, and
+    dropout is used in the dense layers to reduce overfitting. No pooling
+    is applied as the input sequence is already short and pooling would
+    discard useful spatial information. The final softmax layer outputs
+    probability scores across all classes.
 
     Args:
         input_shape: Shape of input data as (features, channels).
@@ -272,18 +273,30 @@ def build_model(input_shape, num_classes):
     model = keras.models.Sequential([
         keras.layers.Input(shape=input_shape),
 
-        # Convolutional block with two stacked Conv1D layers at 256 filters.
-        # Batch normalisation is used after each layer to ensure that the
-        # outputs of each layer are steady, which leads to the model being
-        # able to train more effectively.
+        # First convolutional block with two stacked Conv1D layers at 256
+        # filters. Batch normalisation is used after each layer to ensure
+        # that the outputs of each layer are steady, which leads to the
+        # model being able to train more effectively.
         keras.layers.Conv1D(256, kernel_size=3, padding='same'),
-        keras.layers.BatchNormalization(),
+        keras.layers.BatchNormalization(momentum=0.9),
         keras.layers.ReLU(),
         keras.layers.Conv1D(256, kernel_size=3, padding='same'),
-        keras.layers.BatchNormalization(),
+        keras.layers.BatchNormalization(momentum=0.9),
         keras.layers.ReLU(),
 
-        # The output of the convolutional block is flattened, transforming
+        # Second convolutional block with two stacked Conv1D layers at 512
+        # filters. Doubling the filter count between blocks gives the
+        # network more capacity to combine the simpler patterns learned in
+        # the first block into higher level patterns useful for
+        # classification.
+        keras.layers.Conv1D(512, kernel_size=3, padding='same'),
+        keras.layers.BatchNormalization(momentum=0.9),
+        keras.layers.ReLU(),
+        keras.layers.Conv1D(512, kernel_size=3, padding='same'),
+        keras.layers.BatchNormalization(momentum=0.9),
+        keras.layers.ReLU(),
+
+        # The output of the convolutional blocks is flattened, transforming
         # the multi-dimensional output into a one-dimensional vector ready
         # for the dense classification layers.
         keras.layers.Flatten(),
@@ -292,10 +305,10 @@ def build_model(input_shape, num_classes):
         # convolutional block and produce the classification decision.
         # Dropout is applied to reduce overfitting during training.
         keras.layers.Dense(512, activation='relu'),
-        keras.layers.BatchNormalization(),
+        keras.layers.BatchNormalization(momentum=0.9),
         keras.layers.Dropout(0.3),
         keras.layers.Dense(256, activation='relu'),
-        keras.layers.BatchNormalization(),
+        keras.layers.BatchNormalization(momentum=0.9),
         keras.layers.Dropout(0.3),
 
         # The final softmax layer converts the raw output values into
@@ -309,7 +322,7 @@ def build_model(input_shape, num_classes):
     # one-hot encoded vectors.
     model.compile(
         loss='sparse_categorical_crossentropy',
-        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
+        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE, clipnorm=1.0),
         metrics=['accuracy'],
     )
 
@@ -428,6 +441,7 @@ def evaluate(model, X_test, y_test, class_names):
     # Used to make the confusion matrix. The diagonals represent correct
     # predictions.
     cm = confusion_matrix(y_test, y_pred)
+    cm_percentage = (cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]) * 100
 
     # Code to plot the confusion matrix as a heatmap, with the counts inside
     # of each square and the numbers formatted to integers.
@@ -441,6 +455,19 @@ def evaluate(model, X_test, y_test, class_names):
     plt.yticks(rotation=0, fontsize=8)
     plt.tight_layout()
     plt.savefig(CONFUSION_MATRIX_PATH, dpi=600)
+    plt.show()
+
+    plt.figure(figsize=(20, 18))
+    sns.heatmap(cm_percentage, annot=True, fmt='.1f', cmap='Blues',
+                xticklabels=class_names, yticklabels=class_names,
+                vmin=0, vmax=100)
+    plt.title('Confusion Matrix (%): IoT Intrusion Detection CNN')
+    plt.ylabel('Actual Class')
+    plt.xlabel('Predicted Class')
+    plt.xticks(rotation=90, ha='right', fontsize=8)
+    plt.yticks(rotation=0, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(CONFUSION_MATRIX_PERCENTAGE_PATH, dpi=600)
     plt.show()
 
     # Build the classification report, which shows precision, recall and
@@ -460,16 +487,19 @@ def evaluate(model, X_test, y_test, class_names):
 def main():
     """Main function to run the program."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    X_train, X_val, X_test, y_train, y_val, y_test, class_names = \
-        preprocess_data(DATA_PATH, GLOBAL_CAP_PER_CLASS)
+    (X_train, X_val, X_test, y_train, y_val, y_test, class_names,
+     scaler, label_encoder) = preprocess_data(DATA_PATH, GLOBAL_CAP_PER_CLASS)
     model = build_model(input_shape=(X_train.shape[1], 1),
                         num_classes=len(class_names))
     model.summary()
     history = train(model, X_train, y_train, X_val, y_val)
+
     plot_history(history)
     print(f"Training curves saved to '{TRAINING_CURVES_PATH}'")
     evaluate(model, X_test, y_test, class_names)
     print(f"Confusion matrix saved to '{CONFUSION_MATRIX_PATH}'")
+    print(f"Confusion matrix (percentage) saved to "
+          f"'{CONFUSION_MATRIX_PERCENTAGE_PATH}'")
     print(f"Classification report saved to '{CLASSIFICATION_REPORT_PATH}'")
 
 
